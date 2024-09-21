@@ -945,16 +945,14 @@ static void Convert_Data(void) {
 }
 
 static void Check_Data(void) {
-	float diff = cell_data[0][0].voltage - MAX_MEASURE_VOLT;
-	if ( ((diff > 0) ? diff < 1e-9f : diff > 1e-9f) ) {
+	if ( cell_data[0][0].voltage >= MAX_MEASURE_VOLT ) {
 		bms_state = FAULT;
 		pack_flags.cell_over_voltage = 1;
 		cell_flags[0][0].over_voltage = true;
 		printf("MAX_VOLT\n\r");
 	}
 
-	diff = cell_data[0][0].voltage - MIN_VOLT;
-	if ( ((diff > 0) ? diff < 1e-9f : diff > 1e-9f) ) {
+	if ( cell_data[0][0].voltage < MIN_VOLT ) {
 		bms_state = FAULT;
 		pack_flags.cell_under_voltage = 1;
 		cell_flags[0][0].under_temperature = true;
@@ -1025,7 +1023,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 		}
 
 		float diff = highest_voltage - MAX_CHARGING_VOLT;
-		if ( bms_state == CHARGING && ((diff > 0) ? diff < 1e-9f : diff > 1e-9f) ) {
+		if ( bms_state == CHARGING && ((diff > 0) ? diff < 1e-9f : diff > -1e-9f) ) {
 			bms_state = MEASURE;
 			pack_flags.charging = false;
 		}
