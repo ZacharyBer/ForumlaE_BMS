@@ -15,13 +15,6 @@
   *
   ******************************************************************************
   */
-
-// Datasheets used:
-// Cell Pack: https://web.archive.org/web/20210614083255/https://www.energusps.com/web/binary/saveas?filename_field=datas_fname&field=datas&model=ir.attachment&id=4223
-// LTC6811: https://www.analog.com/media/en/technical-documentation/data-sheets/LTC6811-1-6811-2.pdf
-// LTC6820: https://www.analog.com/media/en/technical-documentation/data-sheets/LTC6820.pdf
-// FSAE Electric Energy Meter: https://fsaeonline.com/content/Energy-Meter-Specification-021317.pdf
-
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
@@ -29,6 +22,10 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdbool.h>
+#include<stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,13 +57,23 @@ typedef struct {
 	uint16_t temperature;
 } CELL_DATA_RAW;
 
+// 128 bytes (no byte stuffing)
 typedef struct {
 	bool over_voltage;
 	bool over_power;
 	bool over_temperature;
+	bool under_voltage;
+	uint16_t cell_over_voltage;
+	uint16_t cell_under_voltage;
+	uint16_t cell_over_temperature;
+	uint16_t cell_under_temperature;
+	bool discharging;
+	bool fault_triggered;
 	bool charging;
+	bool sleep;
 } PACK_FLAGS;
 
+// 32 bytes (no byte stuffing)
 typedef struct {
 	bool over_voltage;
 	bool under_voltage;
@@ -74,6 +81,7 @@ typedef struct {
 	bool under_temperature;
 } CELL_FLAGS;
 
+// 224 bytes
 typedef struct {
 	uint32_t timestamp_ms;
 	uint32_t packet_counter;
@@ -85,9 +93,9 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define ADC_TO_VOLT(n)	 	(float)(((float)n * 5) / (1 << 16)) // 5V reference, 16 bit precision
+#define ADC_TO_VOLT(n)	 	(float)(((float)n * 5) / (1 << 12)) // 5V reference, 12 bit precision
 /* Linreg applied on data given in Cell Pack Table 2. moved to be centered on (1.51,60) */
-#define VOLT_TO_DEG_C(n) 	(float)(-116.5918987((float)n - 1.51) + 60)
+#define VOLT_TO_DEG_C(n) 	(float)(-116.5918987*((float)n - 1.51) + 60)
 #define MIN_VOLT			(float)2.5 // 2.5 Volts as per Cell Pack Table 1
 #define MAX_MEASURE_VOLT	(float)4.2 // 4.2 Volts as per Cell Pack Table 1
 #define MAX_CHARGING_VOLT	(float)4.2 // Sometimes this may be set differently (4.3V)
@@ -95,10 +103,11 @@ typedef struct {
 #define MIN_CELL_TEMP		(float)-20  // -20 degC as per Cell Pack Table 1
 #define MAX_PACK_POWER		(float)80*1000 // 80kW as per EV.3.3.1
 #define MAX_PACK_VOLTAGE	(float)600 // 600V DC as per EV.3.3.2
-#define NUM_IC				(uint8_t)2 // could be any value
-#define CELL_PER_IC			(uint8_t)2 // could be any value <= 12
-#define TIME_TO_SLEEP		(uint32_t)10*60 // time (in sec) where I_sleep > I_out after which enter sleep mode (can be anything)
-#define SLEEP_CURRENT		(float)1 // I_sleep (can be any value)
+#define NUM_IC				(uint8_t)1 // could be any value
+#define CELL_PER_IC			(uint8_t)1 // could be any value <= 12
+#define TIME_TO_SLEEP		(uint32_t)10 // time (in s) where I_sleep > I_out after which enter sleep mode (can be anything)
+#define TIME_TO_CHARGE		(uint32_t)1 // time (in s) where I_out > I_in after which enter charge mode (can be anything)
+#define SLEEP_CURRENT		(float)4 // I_sleep (can be any value)
 
 /* USER CODE END PD */
 
@@ -108,15 +117,30 @@ typedef struct {
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+ADC_HandleTypeDef hadc2;
+
 CAN_HandleTypeDef hcan1;
 
 SPI_HandleTypeDef hspi2;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim4;
 
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+#ifdef __GNUC__
+#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
+#else
+#define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
+#endif
+PUTCHAR_PROTOTYPE {
+  HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+  return ch;
+}
+
 static BMS_STATES bms_state = SELF_TEST;
 static PACK_DATA pack_data;
 static CELL_DATA_RAW cell_data_raw[NUM_IC][CELL_PER_IC];
@@ -124,29 +148,49 @@ static CELL_DATA cell_data[NUM_IC][CELL_PER_IC];
 static PACK_FLAGS pack_flags;
 static CELL_FLAGS cell_flags[NUM_IC][CELL_PER_IC];
 static CAN_DATA can_data;
+static bool has_initialized;
+static bool has_initialized_sleep;
+static bool tim1_on;
+static bool tim3_on;
+static uint8_t current_cs;
+static uint8_t current_cell[NUM_IC];
+static uint32_t charging_timer;
+static uint32_t sleep_timer;
+static float highest_voltage;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void PeriphCommonClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_ADC2_Init(void);
+static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 static void BMS_State_Machine(void);
 static void Init_Peripherals(void);
 static bool Peripheral_Check(void);
 static bool Proper_Peripheral_Init(void);
+static void Enable_TS(void);
+static void Disable_TS(void);
+static void Read_Current(void);
+static void SPI_Read(void);
 static void SPI_CS_Toggle(void);
 static void Convert_Data(void);
 static void Check_Data(void);
 static void CAN_Send(void);
 static void Enable_Low_Power(void);
 static void Disable_Low_Power(void);
+static bool Balance_Cells(void);
 static void Discharge_Cell(void);
 static void Discharge_Pack(void);
+static void ConvertEndian(uint8_t *result, uint32_t original);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -176,6 +220,9 @@ int main(void)
   /* Configure the system clock */
   SystemClock_Config();
 
+/* Configure the peripherals common clocks */
+  PeriphCommonClock_Config();
+
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
@@ -186,7 +233,12 @@ int main(void)
   MX_SPI2_Init();
   MX_CAN1_Init();
   MX_TIM1_Init();
+  MX_TIM3_Init();
+  MX_ADC1_Init();
+  MX_ADC2_Init();
+  MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
 
   /* USER CODE END 2 */
 
@@ -197,6 +249,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+	  // Begin State Machine
+	  BMS_State_Machine();
   }
   /* USER CODE END 3 */
 }
@@ -248,6 +303,164 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief Peripherals Common Clock Configuration
+  * @retval None
+  */
+void PeriphCommonClock_Config(void)
+{
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  /** Initializes the peripherals clock
+  */
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCCLKSOURCE_PLLSAI1;
+  PeriphClkInit.PLLSAI1.PLLSAI1Source = RCC_PLLSOURCE_HSI;
+  PeriphClkInit.PLLSAI1.PLLSAI1M = 1;
+  PeriphClkInit.PLLSAI1.PLLSAI1N = 8;
+  PeriphClkInit.PLLSAI1.PLLSAI1P = RCC_PLLP_DIV7;
+  PeriphClkInit.PLLSAI1.PLLSAI1Q = RCC_PLLQ_DIV2;
+  PeriphClkInit.PLLSAI1.PLLSAI1R = RCC_PLLR_DIV2;
+  PeriphClkInit.PLLSAI1.PLLSAI1ClockOut = RCC_PLLSAI1_ADC1CLK;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 2;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief ADC2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC2_Init(void)
+{
+
+  /* USER CODE BEGIN ADC2_Init 0 */
+
+  /* USER CODE END ADC2_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC2_Init 1 */
+
+  /* USER CODE END ADC2_Init 1 */
+
+  /** Common config
+  */
+  hadc2.Instance = ADC2;
+  hadc2.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
+  hadc2.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc2.Init.LowPowerAutoWait = DISABLE;
+  hadc2.Init.ContinuousConvMode = DISABLE;
+  hadc2.Init.NbrOfConversion = 1;
+  hadc2.Init.DiscontinuousConvMode = DISABLE;
+  hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc2.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc2.Init.DMAContinuousRequests = DISABLE;
+  hadc2.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc2.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_6;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC2_Init 2 */
+
+  /* USER CODE END ADC2_Init 2 */
+
 }
 
 /**
@@ -346,9 +559,9 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 80-1;
+  htim1.Init.Prescaler = 8000-1;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 1000;
+  htim1.Init.Period = 10000;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
@@ -371,6 +584,100 @@ static void MX_TIM1_Init(void)
   /* USER CODE BEGIN TIM1_Init 2 */
 
   /* USER CODE END TIM1_Init 2 */
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 8000-1;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 50000;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+  * @brief TIM4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM4_Init(void)
+{
+
+  /* USER CODE BEGIN TIM4_Init 0 */
+
+  /* USER CODE END TIM4_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM4_Init 1 */
+
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 0;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 65535;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI1;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim4, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM4_Init 2 */
+
+  /* USER CODE END TIM4_Init 2 */
 
 }
 
@@ -452,31 +759,356 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : BALANCE_CELLS_Pin WAKE_Pin */
+  GPIO_InitStruct.Pin = BALANCE_CELLS_Pin|WAKE_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : DISCHARGE_Pin */
+  GPIO_InitStruct.Pin = DISCHARGE_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(DISCHARGE_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-static void bms_state_machine(void) {
+
+// Main state machine for the BMS where bms_state is the current state
+static void BMS_State_Machine(void) {
 	switch(bms_state) {
 		case SELF_TEST:
+			printf("TESTING\n\r");
+			// To avoid repeated initializations
+			if ( !has_initialized ) {
+				Init_Peripherals();
+			}
 
+			// Check that peripherals are reachable, if so -> INIT
+			if ( Peripheral_Check() ) {
+				bms_state = INIT;
+			}
 
 			break;
 		case INIT:
+
+			if ( has_initialized_sleep ) {
+				Disable_Low_Power();
+			}
+
+			// Check peripheral fault registers and configuration, if so -> MEASURE
+			if ( Proper_Peripheral_Init() ) {
+				Enable_TS();
+				bms_state = MEASURE;
+			}
+
 			break;
 		case MEASURE:
+			if ( tim3_on ) {
+				HAL_TIM_Base_Stop_IT(&htim3);  // Stop 5 ms timer
+				tim3_on = false;
+			}
+
+			if ( !tim1_on ) {
+				HAL_TIM_Base_Start_IT(&htim1);  // Start 1 ms timer
+				tim1_on = true;
+			}
+
 			break;
 		case CHARGING:
 			break;
 		case CHARGING_W_CB:
 			break;
 		case FAULT:
+
+			if ( !pack_flags.fault_triggered ) {
+				Disable_TS();
+				pack_flags.fault_triggered = true;
+			}
+
+			if ( tim3_on ) {
+				HAL_TIM_Base_Stop_IT(&htim3);  // Stop 5 ms timer
+				tim3_on = false;
+			}
+
+			if ( !tim1_on ) {
+				HAL_TIM_Base_Start_IT(&htim1);  // Start 1 ms timer
+				tim1_on = true;
+			}
+
 			break;
 		case SLEEP:
+
+			if ( !has_initialized_sleep ) {
+				Enable_Low_Power();
+			}
+
+			if ( tim1_on ) {
+				HAL_TIM_Base_Stop_IT(&htim1);  // Stop 1 ms timer
+				tim1_on = false;
+			}
+
+			if ( !tim3_on ) {
+				HAL_TIM_Base_Start_IT(&htim3);  // Start 5 ms timer
+				tim3_on = true;
+			}
+
 			break;
 		case SELF_DISCHARGE:
+
+			if ( !pack_flags.discharging ) {
+				Disable_TS();
+				Discharge_Pack();
+				pack_flags.discharging = true;
+			}
+
+			if ( tim3_on ) {
+				HAL_TIM_Base_Stop_IT(&htim3);  // Stop 5 ms timer
+				tim3_on = false;
+			}
+
+			if ( !tim1_on ) {
+				HAL_TIM_Base_Start_IT(&htim1);  // Start 1 ms timer
+				tim1_on = true;
+			}
+
 			break;
+	}
+}
+
+static void Init_Peripherals(void) {
+	HAL_ADC_Start(&hadc1);
+	HAL_ADC_Start(&hadc2);
+	HAL_TIM_Encoder_Start(&htim4,TIM_CHANNEL_ALL);
+
+	has_initialized = true;
+}
+
+static bool Peripheral_Check(void) {
+	SPI_Read();
+
+	return true;
+}
+
+static bool Proper_Peripheral_Init(void) {
+	return true;
+}
+
+static void Enable_TS(void) {
+	HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+}
+
+static void Disable_TS(void) {
+	HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+}
+
+static void Read_Current(void) {
+	pack_data.current = (int16_t)htim4.Instance->CNT;
+}
+
+static void SPI_Read(void) {
+
+	HAL_ADC_Start(&hadc1);
+
+	HAL_ADC_PollForConversion(&hadc1, 100);
+
+	cell_data_raw[0][0].voltage = HAL_ADC_GetValue(&hadc1);
+
+	HAL_ADC_Stop(&hadc1);
+
+	HAL_ADC_Start(&hadc2);
+
+	HAL_ADC_PollForConversion(&hadc2, 100);
+
+	cell_data_raw[0][0].temperature = HAL_ADC_GetValue(&hadc2);
+
+	HAL_ADC_Stop(&hadc2);
+}
+
+static void SPI_CS_Toggle(void) {
+
+}
+
+static void Convert_Data(void) {
+	cell_data[0][0].voltage = ADC_TO_VOLT(cell_data_raw[0][0].voltage);
+	cell_data[0][0].temperature = VOLT_TO_DEG_C(ADC_TO_VOLT(cell_data_raw[0][0].temperature));
+}
+
+static void Check_Data(void) {
+	float diff = cell_data[0][0].voltage - MAX_MEASURE_VOLT;
+	if ( ((diff > 0) ? diff < 1e-9f : diff > 1e-9f) ) {
+		bms_state = FAULT;
+		pack_flags.cell_over_voltage = 1;
+		cell_flags[0][0].over_voltage = true;
+		printf("MAX_VOLT\n\r");
+	}
+
+	diff = cell_data[0][0].voltage - MIN_VOLT;
+	if ( ((diff > 0) ? diff < 1e-9f : diff > 1e-9f) ) {
+		bms_state = FAULT;
+		pack_flags.cell_under_voltage = 1;
+		cell_flags[0][0].under_temperature = true;
+		printf("MIN_VOLT\n\r");
+	}
+
+	if ( cell_data[0][0].temperature > MAX_CELL_TEMP ) {
+		bms_state = FAULT;
+		pack_flags.cell_over_temperature = 1;
+		cell_flags[0][0].over_temperature = true;
+		printf("TEMP\n\r");
+	}
+}
+
+static void CAN_Send(void) {
+	printf("State: %i, Current: %f, Voltage: %f, Temperature: %f\n\r", bms_state, pack_data.current, cell_data[0][0].voltage, cell_data[0][0].temperature);
+}
+
+static void Enable_Low_Power(void) {
+
+}
+
+static void Disable_Low_Power(void) {
+
+}
+
+static bool Balance_Cells(void) {
+	return false;
+}
+
+static void Discharge_Cell(void) {
+
+}
+
+static void Discharge_Pack(void) {
+
+}
+
+static void ConvertEndian(uint8_t *result, uint32_t original) {
+  // Example Edian Conversion for 4 byte read/writes where SPI sends over 16 bit words
+  // Simpler for 2 byte, where upper byte swaps with lower byte
+  // o3 o2 o1 o0 --> o2 o3 o0 o1 as r3 r2 r1 r0
+
+  result[0] = (original >> 16) & 0xFF;
+  result[1] = (original >> 24) & 0xFF;
+  result[2] = original & 0xFF;
+  result[3] = (original >> 8) & 0xFF;
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+	if ( htim == &htim1 ) {
+		// Rollover must be handled by master
+		can_data.timestamp_ms++;
+		can_data.timestamp_ms =
+				(can_data.timestamp_ms == 0xFFFF) ? 0 : can_data.timestamp_ms;
+
+		SPI_Read();
+		Read_Current();
+
+		Convert_Data();
+		Check_Data();
+		CAN_Send();
+
+		if ( bms_state == CHARGING_W_CB ) {
+			if ( Balance_Cells() ) {
+				bms_state = CHARGING;
+			}
+		}
+
+		float diff = highest_voltage - MAX_CHARGING_VOLT;
+		if ( bms_state == CHARGING && ((diff > 0) ? diff < 1e-9f : diff > 1e-9f) ) {
+			bms_state = MEASURE;
+			pack_flags.charging = false;
+		}
+
+		if ( bms_state == CHARGING && pack_data.current >= 0 && pack_flags.charging ) {
+			bms_state = MEASURE;
+			pack_flags.charging = false;
+		}
+
+		if ( bms_state == MEASURE && pack_data.current < 0 && !pack_flags.charging ) {
+			if ( charging_timer >=  TIME_TO_CHARGE ) {
+				charging_timer = 0;
+				bms_state = CHARGING;
+				pack_flags.charging = true;
+			}
+
+			charging_timer++;
+		}
+		else {
+			charging_timer = 0;
+		}
+
+		if ( bms_state == MEASURE && pack_data.current >= 0 && pack_data.current < SLEEP_CURRENT && !pack_flags.sleep ) {
+			if ( sleep_timer >=  TIME_TO_SLEEP ) {
+				sleep_timer = 0;
+				bms_state = SLEEP;
+				pack_flags.sleep = true;
+			}
+
+			sleep_timer++;
+		}
+		else {
+			sleep_timer = 0;
+		}
+	}
+
+	else if ( htim == &htim3 ) {
+		// Rollover must be handled by master
+		can_data.timestamp_ms += 5;
+		can_data.timestamp_ms =
+				(can_data.timestamp_ms == 0xFFFF) ? 0 : can_data.timestamp_ms;
+
+		SPI_Read();
+		Read_Current();
+
+		Convert_Data();
+		Check_Data();
+		CAN_Send();
+
+		if ( bms_state == SLEEP && (pack_data.current < 0 || pack_data.current > SLEEP_CURRENT) ) {
+			bms_state = INIT;
+			pack_flags.sleep = false;
+		}
+	}
+}
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
+	if ( hspi == &hspi2 ) {
+
+	}
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    if ( GPIO_Pin == WAKE_Pin ) {
+    	if ( bms_state == SLEEP ) {
+    		bms_state = MEASURE;
+    		pack_flags.sleep = false;
+    	}
+    }
+
+    if ( GPIO_Pin == BALANCE_CELLS_Pin ) {
+    	if ( bms_state == CHARGING ) {
+    		bms_state = CHARGING_W_CB;
+    	}
+    	else if ( bms_state == CHARGING_W_CB ) {
+			bms_state = CHARGING;
+		}
+	}
+
+    if ( GPIO_Pin == DISCHARGE_Pin ) {
+		if ( bms_state == MEASURE || bms_state == SLEEP ) {
+			bms_state = SELF_DISCHARGE;
+		}
 	}
 }
 /* USER CODE END 4 */
