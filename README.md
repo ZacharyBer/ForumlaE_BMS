@@ -31,4 +31,4 @@ The current reading
 The cell voltage
 The cell temperature
 
-This is all encompassed in the skeleton of a program which is set to utiliza SPI and CAN over multiple cells, enable discharge circuitry, etc
+This is all encompassed in the skeleton of a program which is set to utiliza SPI and CAN over multiple cells, enable discharge circuitry, etc while also reading back the most information possible and indicating any rule infracton as per the Formula SAE rulebook
